@@ -1,15 +1,16 @@
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
     instruction::Instruction,
     pubkey::Pubkey,
-    signature::{Keypair, Signer},
+    signature::{Keypair, Signature, Signer},
     system_instruction,
     transaction::Transaction,
 };
+use solana_transaction_status::UiTransactionEncoding;
 
 const LOCALNET: &str = "http://127.0.0.1:8899";
 
@@ -64,7 +65,14 @@ pub async fn create_nonce_account(
         blockhash,
     );
 
-    let signature = rpc.send_and_confirm_transaction(&transaction).await?;
+    let signature = rpc
+        .send_and_confirm_transaction_with_spinner_and_commitment(
+            &transaction,
+            CommitmentConfig {
+                commitment: CommitmentLevel::Finalized,
+            },
+        )
+        .await?;
     println!("Created nonce account: {}", signature);
 
     Ok(())
@@ -114,7 +122,7 @@ pub async fn create_and_sign_nonce_transaction(
 pub async fn send_to_multiple_providers(
     rpc_urls: Vec<String>,
     transaction: Transaction,
-) -> Result<String> {
+) -> Result<Vec<Result<(String, String), Error>>> {
     use futures::future::join_all;
 
     let serialized_tx =
@@ -126,6 +134,20 @@ pub async fn send_to_multiple_providers(
         let tx: Transaction =
             bincode::deserialize(&tx_data).context("Failed to deserialize transaction")?;
 
+        match client.simulate_transaction(&tx).await {
+            Ok(sim_result) => {
+                if let Some(err) = sim_result.value.err {
+                    tracing::warn!("Transaction simulation error: {:?}", err);
+                    tracing::warn!("Logs: {:?}", sim_result.value.logs);
+                } else {
+                    tracing::info!("Transaction simulation successful");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to simulate transaction: {}", e);
+            }
+        }
+
         match client
             .send_transaction_with_config(
                 &tx,
@@ -133,18 +155,18 @@ pub async fn send_to_multiple_providers(
                     skip_preflight: true, // CRITICAL for nonce transactions
                     preflight_commitment: Some(CommitmentLevel::Finalized),
                     encoding: None,
-                    max_retries: None,
+                    max_retries: Some(5),
                     min_context_slot: None,
                 },
             )
             .await
         {
             Ok(signature) => {
-                println!("Transaction submitted to {}: {}", url, signature);
+                tracing::info!("Transaction submitted to {}: {}", url, signature);
                 Ok((url, signature.to_string()))
             }
             Err(e) => {
-                println!("Error submitting to {}: {}", url, e);
+                tracing::error!("Error submitting to {}: {:?}", url, e);
                 Err(anyhow::anyhow!("Transaction submission error: {}", e))
             }
         }
@@ -156,16 +178,60 @@ pub async fn send_to_multiple_providers(
 
     let results = join_all(futures).await;
 
-    if let Some((provider, signature)) = results.into_iter().flatten().next() {
-        return Ok(format!(
-            "Transaction processed by {}: {}",
-            provider, signature
-        ));
+    Ok(results)
+}
+
+pub async fn monitor_transaction_status(
+    client: &RpcClient,
+    signature: &Signature,
+    max_attempts: usize,
+) -> Result<()> {
+    let mut attempts = 0;
+
+    while attempts < max_attempts {
+        match client.get_signature_status(signature).await {
+            Ok(Some(status)) => {
+                if let Err(err) = status {
+                    tracing::error!("Transaction failed: {:?}", err);
+                    return Err(anyhow::anyhow!("Transaction failed: {:?}", err));
+                } else {
+                    tracing::info!("Transaction succeeded!");
+
+                    if let Ok(tx_details) = client
+                        .get_transaction(signature, UiTransactionEncoding::Json)
+                        .await
+                    {
+                        tracing::info!(
+                            "Transaction details: meta.err={:?}, meta.log_messages={:?}",
+                            tx_details
+                                .transaction
+                                .meta
+                                .as_ref()
+                                .and_then(|m| m.err.clone()),
+                            tx_details
+                                .transaction
+                                .meta
+                                .as_ref()
+                                .map(|m| &m.log_messages)
+                        );
+                    }
+
+                    return Ok(());
+                }
+            }
+            Ok(None) => {
+                tracing::info!("Transaction status: pending (attempt {})", attempts + 1);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get transaction status: {}", e);
+            }
+        }
+
+        attempts += 1;
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
 
-    Err(anyhow::anyhow!(
-        "All providers failed to process the transaction"
-    ))
+    Err(anyhow::anyhow!("Transaction status check timed out"))
 }
 
 #[tokio::main]
@@ -231,12 +297,16 @@ async fn main() -> Result<()> {
         solana_sdk::nonce::State::Uninitialized => {}
         solana_sdk::nonce::State::Initialized(ref data) => {
             tracing::info!("Nonce data: {nonce_data:?}");
-
             let nonce_hash = data.blockhash().to_string();
             println!("Current nonce: {}", nonce_hash);
-
             let transfer_ix =
                 system_instruction::transfer(&sender.pubkey(), &Pubkey::new_unique(), 50_000_000);
+
+            let first_rpc_url = LOCALNET.to_string();
+            let client = RpcClient::new_with_commitment(
+                first_rpc_url.clone(),
+                CommitmentConfig::finalized(),
+            );
 
             let signed_tx = create_and_sign_nonce_transaction(
                 &sender,
@@ -249,13 +319,82 @@ async fn main() -> Result<()> {
 
             tracing::info!("Transaction created: {:?}", signed_tx);
 
-            let rpc_urls = [LOCALNET, LOCALNET, LOCALNET]
-                .iter()
-                .map(|el| el.to_string())
-                .collect::<Vec<_>>();
+            for (i, instruction) in signed_tx.message.instructions.iter().enumerate() {
+                tracing::info!(
+                    "Instruction {}: program_id_index={}, accounts={:?}, data_len={}",
+                    i,
+                    instruction.program_id_index,
+                    instruction.accounts,
+                    instruction.data.len()
+                );
+            }
 
-            let result = send_to_multiple_providers(rpc_urls, signed_tx).await?;
-            println!("Result: {}", result);
+            match client
+                .send_transaction_with_config(
+                    &signed_tx,
+                    RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        preflight_commitment: Some(CommitmentLevel::Finalized),
+                        encoding: None,
+                        max_retries: Some(5),
+                        min_context_slot: None,
+                    },
+                )
+                .await
+            {
+                Ok(signature) => {
+                    tracing::info!("Transaction submitted successfully: {}", signature);
+
+                    let sig = Signature::from_str(&signature.to_string())?;
+                    if let Err(e) = monitor_transaction_status(&client, &sig, 10).await {
+                        tracing::error!("Transaction monitoring error: {}", e);
+                    }
+
+                    let nonce_data_after_first =
+                        get_nonce_acc_data(&client, &nonce_acc.pubkey()).await?;
+                    tracing::info!(
+                        "Nonce data after first transaction: {:?}",
+                        nonce_data_after_first
+                    );
+
+                    if (client.get_signature_status(&sig).await).is_ok() {
+                        tracing::info!("Attempting to send the same transaction again");
+                        match client
+                            .send_transaction_with_config(
+                                &signed_tx,
+                                RpcSendTransactionConfig {
+                                    skip_preflight: true, // CRITICAL for nonce transactions
+                                    preflight_commitment: Some(CommitmentLevel::Finalized),
+                                    encoding: None,
+                                    max_retries: Some(5),
+                                    min_context_slot: None,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(sig2) => {
+                                tracing::warn!(
+                                    "Second transaction went through! This shouldn't happen: {}",
+                                    sig2
+                                );
+
+                                let nonce_data_after_second =
+                                    get_nonce_acc_data(&client, &nonce_acc.pubkey()).await?;
+                                tracing::info!(
+                                    "Nonce data after second transaction: {:?}",
+                                    nonce_data_after_second
+                                );
+                            }
+                            Err(e) => {
+                                tracing::info!("Second transaction failed as expected: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to send transaction: {:?}", e);
+                }
+            }
         }
     }
 
